@@ -1029,8 +1029,46 @@ def install_mediator(args):
     print_info('Chrome extension is bundled in the BruvTab package output.')
 
 
+def eval_result_error(result):
+    try:
+        data = loads(result)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get('error'):
+        return data['error']
+    return None
+
+
 def executejs(args):
-    pass
+    bruvtab_logger.info('Evaluating JS expression: %s', args.expression)
+    apis = create_clients_from_args(args)
+    if args.tab is not None:
+        tab_id = resolve_tab_selector(apis, args.tab)
+        if tab_id is None:
+            return 1
+        tab_ids = [tab_id]
+    else:
+        tab_ids = [tab_id for tab_id in get_active_tab_ids(apis) if is_tab_id(tab_id)]
+        if not tab_ids:
+            print_error('No active tabs found')
+            return 1
+    api = MultipleMediatorsAPI(apis)
+    results = api.eval_expression(tab_ids, args.expression)
+    lines = []
+    exit_code = 0
+    for tab_id, result in results:
+        error = eval_result_error(result)
+        if error is not None:
+            print_error('eval in %s: %s' % (tab_id, error))
+            exit_code = 1
+            continue
+        if len(results) > 1:
+            lines.append('%s\t%s' % (tab_id, result))
+        else:
+            lines.append(result)
+    if lines:
+        stdout_buffer_write(marshal(lines))
+    return exit_code
 
 
 def no_command(parser, args):
@@ -1222,6 +1260,18 @@ def build_parser():
                                    help='Output raw image bytes to stdout')
     parser_screenshot.add_argument('--wait', type=float, default=0,
                                    help='Wait time in seconds before taking the screenshot')
+
+    parser_eval = subparsers.add_parser(
+        'eval',
+        help='Evaluate a JavaScript expression in a browser tab and print the '
+             'result to stdout. By default targets the active tab of each '
+             'client; optionally target a specific tab by ID, title, or URL '
+             'fragment')
+    parser_eval.set_defaults(func=executejs)
+    parser_eval.add_argument('expression', type=str,
+                             help='JavaScript expression to evaluate')
+    parser_eval_tab = parser_eval.add_argument('tab', type=str, nargs='?',
+                                               help='Optional tab ID, title, or URL fragment to target')
 
     parser_search_tabs = subparsers.add_parser(
         'search',
@@ -1481,6 +1531,7 @@ def build_parser():
     parser_mute_tab.completer = complete_playing_tab_ids
     parser_unmute_tab.completer = complete_tab_ids
     parser_screenshot_tab.completer = complete_tab_ids
+    parser_eval_tab.completer = complete_tab_ids
     parser_index_tabs_ids.completer = complete_tab_ids
     parser_new_tab_target.completer = complete_client_or_window
     parser_open_urls_args.completer = complete_open_args

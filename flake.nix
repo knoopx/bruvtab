@@ -7,11 +7,8 @@
 
   outputs = { self, nixpkgs }:
     let
-      version = "2.0.13";
+      version = "2.0.14";
       chromeCrxVersion = version;
-      chromeCrxHash = "sha256-uoWB9oh+B5K9bx1apdQ1BdKdf21CZkEqpqB1mpC+Ugc=";
-      firefoxXpiVersion = version;
-      firefoxXpiHash = "sha256-OPzB3MqH+c1AV30FjQ1k82YH0f3ZGrgl3ORAc9AJPZA=";
       chromeExtensionId = "edpgjheobdplebiikjgjgpmonakingef";
       chromeWebStoreExtensionId = "bkifkhiemhgpnomgdcbcbkifekkecnhk";
       firefoxAddonId = "bruvtab_mediator@example.org";
@@ -45,19 +42,26 @@
         let
           pkgs = import nixpkgs { inherit system; };
           py = pkgs.python3Packages;
-          chromeCrxAsset = pkgs.fetchurl {
-            url = "https://github.com/pschmitt/bruvtab/releases/download/${chromeCrxVersion}/bruvtab-chrome-${chromeCrxVersion}.crx";
-            hash = chromeCrxHash;
-          };
-          firefoxXpiAsset = pkgs.fetchurl {
-            url = "https://github.com/pschmitt/bruvtab/releases/download/${firefoxXpiVersion}/bruvtab-firefox-${firefoxXpiVersion}.xpi";
-            hash = firefoxXpiHash;
-          };
-          chromeCrx = pkgs.runCommand "bruvtab-chrome-crx-${chromeCrxVersion}" { } ''
-              mkdir -p $out
-              cp ${chromeCrxAsset} $out/bruvtab.crx
-              printf '%s' '${chromeExtensionId}' > $out/extension-id
-            '';
+          # The Chrome CRX is built from the local extension source below
+          # (bruvtab/extension/chrome) at the same version as the Firefox XPI.
+          chromeCrx =
+            pkgs.stdenvNoCC.mkDerivation {
+              pname = "bruvtab-chrome-crx";
+              inherit version;
+              src = projectSource;
+              nativeBuildInputs = [ pkgs.zip pkgs.go-crx3 ];
+              dontConfigure = true;
+              dontBuild = true;
+              installPhase = ''
+                mkdir -p "$out"
+                crx3 keygen "$TMPDIR/bruvtab-key.pem" >/dev/null
+                ( cd bruvtab/extension/chrome && zip -qr "$TMPDIR/bruvtab-chrome.zip" . )
+                crx3 pack "$TMPDIR/bruvtab-chrome.zip" \
+                  --pem "$TMPDIR/bruvtab-key.pem" \
+                  --outfile "$out/bruvtab.crx"
+                printf '%s' '${chromeExtensionId}' > "$out/extension-id"
+              '';
+            };
           bruvtab = py.buildPythonApplication {
             pname = "bruvtab";
             inherit version;
@@ -134,22 +138,24 @@
           };
 
           firefoxXpi =
-            pkgs.runCommand "bruvtab-firefox-xpi-${version}"
-              {
-                passthru = {
-                  addonId = firefoxAddonId;
-                  extid = firefoxAddonId;
-                };
-              }
-              ''
-                addon_id='${firefoxAddonId}'
-
-                mkdir -p "$out/share/mozilla/extensions/${firefoxAppId}"
-                cp ${firefoxXpiAsset} "$out/$addon_id.xpi"
-
-                ln -s "$out/$addon_id.xpi" \
-                  "$out/share/mozilla/extensions/${firefoxAppId}/$addon_id.xpi"
+            pkgs.stdenvNoCC.mkDerivation {
+              pname = "bruvtab-firefox-xpi";
+              inherit version;
+              src = projectSource;
+              nativeBuildInputs = [ pkgs.zip ];
+              dontConfigure = true;
+              dontBuild = true;
+              passthru = {
+                addonId = firefoxAddonId;
+                extid = firefoxAddonId;
+              };
+              installPhase = ''
+                mkdir -p "$out" "$out/share/mozilla/extensions/${firefoxAppId}"
+                ( cd bruvtab/extension/firefox && zip -qr "$out/${firefoxAddonId}.xpi" . )
+                ln -s "$out/${firefoxAddonId}.xpi" \
+                  "$out/share/mozilla/extensions/${firefoxAppId}/${firefoxAddonId}.xpi"
               '';
+            };
 
         in
         {

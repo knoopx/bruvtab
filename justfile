@@ -18,6 +18,7 @@ smoke-test: build
   uv run bruvtab windows && \
   uv run bruvtab clients && \
   uv run bruvtab active && \
+  uv run bruvtab eval "1 + 1" && \
   uv run bruvtab words && \
   uv run bruvtab text && \
   uv run bruvtab html

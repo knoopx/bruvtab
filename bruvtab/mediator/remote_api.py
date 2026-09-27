@@ -156,6 +156,16 @@ class BrowserRemoteAPI:
         self._transport.send(command)
         return self._transport.recv()
 
+    def eval_expression(self, tab_id: int, expression: str):
+        mediator_logger.info('evaluating expression in tab: %s, expression: %s', tab_id, expression)
+        command = {
+            'name': 'eval',
+            'tab_id': tab_id,
+            'expression': expression,
+        }
+        self._transport.send(command)
+        return self._transport.recv()
+
     def get_browser(self):
         mediator_logger.info('getting browser name')
         command = {'name': 'get_browser'}

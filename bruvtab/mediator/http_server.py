@@ -74,6 +74,7 @@ class MediatorHttpServer:
         self.app.route('/get_words', methods=['GET'])(self.get_words)
         self.app.route('/get_text', methods=['GET'])(self.get_text)
         self.app.route('/get_html', methods=['GET'])(self.get_html)
+        self.app.route('/eval/<int:tab_id>', methods=['POST'])(self.eval_expression)
         self.app.route('/get_pid', methods=['GET'])(self.get_pid)
         self.app.route('/get_browser', methods=['GET'])(self.get_browser)
         self.app.route('/echo', methods=['GET'])(self.echo)
@@ -186,6 +187,15 @@ class MediatorHttpServer:
                                          decode_query(replace_with),
                                          tab_id)
         return '\n'.join(lines)
+
+    def eval_expression(self, tab_id):
+        expression_file = request.files.get('expression')
+        if expression_file is None:
+            return 'ERROR: Please provide expression in the request'
+        expression = expression_file.stream.read().decode('utf8')
+        mediator_logger.info('Evaluating expression in tab %s: %s', tab_id, expression)
+        result = self.remote_api.eval_expression(tab_id, expression)
+        return result if isinstance(result, str) else dumps(result)
 
     def get_pid(self):
         mediator_logger.info('getting pid')

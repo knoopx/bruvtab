@@ -180,6 +180,14 @@ class SingleMediatorAPI(object):
         query_params.append('tab_id=%s' % local_tab_id)
         return self._get('/get_screenshot?%s' % '&'.join(query_params))
 
+    def eval_expression(self, tab_id, expression):
+        logger.info('SingleMediatorAPI: eval_expression: %s, expression: %s', tab_id, expression)
+        prefix, _window_id, local_tab_id = split_prefixed_tab_id(tab_id)
+        if prefix != self._prefix:
+            return dumps({'error': 'Tab %s is not available on client %s' % (tab_id, self._prefix[:-1])})
+        files = {'expression': expression}
+        return self._post('/eval/%s' % local_tab_id, files)
+
     def query_tabs(self, args):
         query = args
         if isinstance(query, str):
@@ -441,6 +449,14 @@ class MultipleMediatorsAPI(object):
             for tab_id in tab_ids:
                 if api.prefix_match(tab_id):
                     results.extend(api.media_control(tab_id, action))
+        return results
+
+    def eval_expression(self, tab_ids, expression):
+        results = []
+        for api in self.ready_apis:
+            for tab_id in tab_ids:
+                if api.prefix_match(tab_id):
+                    results.append((tab_id, api.eval_expression(tab_id, expression)))
         return results
 
     def move_tabs(self, args):

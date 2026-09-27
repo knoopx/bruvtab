@@ -834,6 +834,175 @@ function mediaControl(window_id, tab_id, action) {
   );
 }
 
+// Serializes a value evaluated in a tab into a JSON-safe structure so the
+// native messaging payload (a JSON channel) always carries printable data.
+// Universal: primitives pass through, and Dates, RegExps, Errors, Maps,
+// Sets, Symbols, functions, DOM nodes/collections, CSS style declarations,
+// iterables, plain objects and custom-class instances are all rendered as
+// plain JSON data; circular references are marked as "$circular".
+const EVAL_RESULT_SERIALIZER = `
+const BRUVTAB_NODE_TEXT_LIMIT = 200;
+
+function bruvtabDescribeNode(node) {
+  const descriptor = {tag: node.tagName ? node.tagName.toLowerCase() : String(node.nodeName)};
+  if (node.id) {
+    descriptor.id = node.id;
+  }
+  const classes = node.getAttribute ? node.getAttribute('class') : null;
+  if (classes) {
+    descriptor.class = classes;
+  }
+  if (node.href) {
+    descriptor.href = node.href;
+  }
+  if (node.src) {
+    descriptor.src = node.src;
+  }
+  const text = (node.textContent || '').trim();
+  if (text) {
+    descriptor.text = text.length > BRUVTAB_NODE_TEXT_LIMIT
+      ? text.slice(0, BRUVTAB_NODE_TEXT_LIMIT) + '...'
+      : text;
+  }
+  return descriptor;
+}
+
+function bruvtabStyleDeclarationToObject(styles) {
+  const result = {};
+  for (let i = 0; i < styles.length; i += 1) {
+    const name = styles[i];
+    if (name) {
+      result[name] = styles.getPropertyValue(name);
+    }
+  }
+  return result;
+}
+
+function bruvtabSerializeOwnProperties(object, ancestors) {
+  ancestors.add(object);
+  const result = {};
+  for (const key of Object.keys(object)) {
+    result[key] = bruvtabSerializeValue(object[key], ancestors);
+  }
+  ancestors.delete(object);
+  return result;
+}
+
+function bruvtabSerializeValue(value, ancestors) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const type = typeof value;
+  if (type === 'string' || type === 'number' || type === 'boolean') {
+    return value;
+  }
+  if (type === 'bigint') {
+    return value.toString() + 'n';
+  }
+  if (type === 'symbol') {
+    return String(value);
+  }
+  if (type === 'function') {
+    return value.name ? '[Function: ' + value.name + ']' : '[Function]';
+  }
+  if (ancestors.has(value)) {
+    return '$circular';
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (value instanceof RegExp) {
+    return '/' + value.source + '/' + value.flags;
+  }
+  if (value instanceof Error) {
+    return {name: value.name, message: value.message, stack: value.stack || null};
+  }
+  if (value instanceof Map) {
+    const entries = [];
+    for (const entry of value.entries()) {
+      entries.push([entry[0], bruvtabSerializeValue(entry[1], ancestors)]);
+    }
+    if (entries.every((entry) => typeof entry[0] === 'string' || typeof entry[0] === 'number')) {
+      const object = {};
+      for (const entry of entries) {
+        object[entry[0]] = entry[1];
+      }
+      return object;
+    }
+    return entries.map((entry) => [bruvtabSerializeValue(entry[0], ancestors), entry[1]]);
+  }
+  if (value instanceof Set) {
+    return Array.from(value).map((item) => bruvtabSerializeValue(item, ancestors));
+  }
+  if (typeof Node !== 'undefined' && value instanceof Node) {
+    return bruvtabDescribeNode(value);
+  }
+  if ((typeof NodeList !== 'undefined' && value instanceof NodeList)
+      || (typeof HTMLCollection !== 'undefined' && value instanceof HTMLCollection)) {
+    return Array.from(value).map((item) => bruvtabSerializeValue(item, ancestors));
+  }
+  if (typeof CSSStyleDeclaration !== 'undefined' && value instanceof CSSStyleDeclaration) {
+    return bruvtabStyleDeclarationToObject(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => bruvtabSerializeValue(item, ancestors));
+  }
+  if (typeof value[Symbol.iterator] === 'function') {
+    return Array.from(value).map((item) => bruvtabSerializeValue(item, ancestors));
+  }
+  const proto = Object.getPrototypeOf(value);
+  const isPlainObject = proto === null || proto === Object.prototype;
+  const constructorName = value.constructor ? value.constructor.name : '';
+  if (!isPlainObject && constructorName && constructorName !== 'Object') {
+    return {__type: constructorName, ...bruvtabSerializeOwnProperties(value, ancestors)};
+  }
+  return bruvtabSerializeOwnProperties(value, ancestors);
+}
+
+function bruvtabSerializeEvalResult(value) {
+  return bruvtabSerializeValue(value, new Set());
+}
+`;
+
+function getEvalScript(expression) {
+  return `(async () => {
+    ${EVAL_RESULT_SERIALIZER}
+    let value;
+    try {
+      value = await (${expression});
+    } catch (error) {
+      return bruvtabSerializeEvalResult(error);
+    }
+    return bruvtabSerializeEvalResult(value);
+  })();`;
+}
+
+function evalExpression(tab_id, expression) {
+  const script = getEvalScript(expression);
+  console.log(`Evaluating expression in tab ${tab_id}: ${expression}`);
+  chrome.scripting.executeScript(
+    {
+      target: { tabId: tab_id },
+      world: 'MAIN',
+      func: (code) => eval(code),
+      args: [script]
+    },
+    (injectionResults) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        const message = `eval failed: tab_id=${tab_id}, expression=${expression}, error=${lastError.message}`;
+        console.error(message);
+        port.postMessage({error: message, tab_id: tab_id});
+        return;
+      }
+      const results = (injectionResults || []).map(r => r.result);
+      const value = results.length > 0 ? results[0] : null;
+      console.log(`Eval result for tab ${tab_id}: ${JSON.stringify(value)}`);
+      port.postMessage(JSON.stringify(value));
+    }
+  );
+}
+
 function activateTab(tab_id, focused) {
   browserTabs.activate(tab_id, focused);
 }
@@ -1159,6 +1328,11 @@ function handleNativeMessage(command) {
   else if (command['name'] == 'media_control') {
     console.log('Controlling media:', command['window_id'], command['tab_id'], command['action']);
     mediaControl(command['window_id'], command['tab_id'], command['action']);
+  }
+
+  else if (command['name'] == 'eval') {
+    console.log('Evaluating expression in tab:', command['tab_id']);
+    evalExpression(command['tab_id'], command['expression']);
   }
 
   else if (command['name'] == 'activate_tab') {

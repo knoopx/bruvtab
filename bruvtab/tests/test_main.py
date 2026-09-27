@@ -1,5 +1,7 @@
 from argparse import Namespace
 from io import StringIO
+from json import dumps
+from json import loads
 from string import ascii_letters
 from time import sleep
 from typing import List
@@ -39,6 +41,24 @@ from bruvtab.utils import encode_query
 
 AUDIBLE_QUERY = encode_query('{"audible": true}')
 MUTED_QUERY = encode_query('{"muted": true}')
+
+# Mirrors the universal eval result serializer of the browser extension
+# (EVAL_RESULT_SERIALIZER in bruvtab/extension/background.js): each
+# expression maps to the JSON-safe value the extension posts back over
+# the native messaging channel after awaiting the evaluated expression.
+EVAL_EXPRESSION_RESULTS = {
+    'new Date(0)': '1970-01-01T00:00:00.000Z',
+    'new Map([["a", 1], ["b", 2]])': {'a': 1, 'b': 2},
+    'new Set([1, 2, 3])': [1, 2, 3],
+    'new Error("boom")': {'name': 'Error', 'message': 'boom', 'stack': 'Error: boom'},
+    '(function () { const obj = {a: 1}; obj.self = obj; return obj; })()':
+        {'a': 1, 'self': '$circular'},
+    ('(function () { class Point { constructor(x, y) { this.x = x; this.y = y; } } '
+     'return new Point(1, 2); })()'):
+        {'__type': 'Point', 'x': 1, 'y': 2},
+    'new Promise(r => setTimeout(() => r(42), 50))': 42,
+    'new Promise(r => setTimeout(() => r({ok: true}), 50))': {'ok': True},
+}
 
 
 class MockedLoggingTransport(Transport):
@@ -137,6 +157,25 @@ class DummyBrowserRemoteAPI:
 
     def media_control(self, window_id: int, tab_id: int, action: str):
         return ['%s.%s\t%s\t0\t0' % (window_id, tab_id, action)]
+
+    def eval_expression(self, tab_id: int, expression: str):
+        # The extension awaits the expression (async eval) and posts the
+        # universal serializer's JSON-safe output back over the channel.
+        if expression in EVAL_EXPRESSION_RESULTS:
+            return dumps(EVAL_EXPRESSION_RESULTS[expression])
+        # Mirror the browser-extension result serializer: plain objects,
+        # NodeList descriptors and CSS style declarations are returned as a
+        # single JSON-safe object so the CLI prints a rich, printable result.
+        return dumps({
+            'expression': expression,
+            'tab': tab_id,
+            'object': {'a': 1, 'b': [1, 2, 3]},
+            'nodeList': [
+                {'tag': 'a', 'id': 'home', 'class': 'nav-item', 'text': 'Home', 'href': 'https://example.com/'},
+                {'tag': 'img', 'id': 'logo', 'src': 'https://example.com/logo.png'},
+            ],
+            'css': {'color': 'rgb(0, 0, 255)', 'font-size': '16px'},
+        })
 
     def get_words(self, tab_id, match_regex, join_with):
         return ['a', 'b']
@@ -870,6 +909,355 @@ class TestScreenshot(WithMediator):
         print_error.assert_called_once_with('Multiple tabs match "google"; using a.1.2')
         assert result == 0
         assert output[-1:] == [b'png']
+
+
+class TestEval(WithMediator):
+    def test_eval_defaults_to_active_tab(self):
+        self.mediator.transport.received_extend([
+            'mocked',
+            '1.2',
+            '"42"',
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', '1 + 1'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'get_active_tabs'},
+            {'name': 'eval', 'tab_id': 2, 'expression': '1 + 1'},
+        ]
+        assert output == [b'"42"\n']
+
+    def test_eval_targets_explicit_tab(self):
+        self.mediator.transport.received_extend([
+            'mocked',
+            '"title"',
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', 'document.title', 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': 'document.title'},
+        ]
+        assert output == [b'"title"\n']
+
+    def test_eval_targets_tab_by_selector(self):
+        self.mediator.transport.received_extend([
+            'mocked',
+            [
+                '1.2\tGoogle Search\thttps://google.com/search',
+                '1.3\tExample\thttps://example.com',
+            ],
+            '"google"',
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', 'location.hostname', 'google.com'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'list_tabs'},
+            {'name': 'eval', 'tab_id': 2, 'expression': 'location.hostname'},
+        ]
+        assert output == [b'"google"\n']
+
+    def test_eval_reports_expression_error(self):
+        self.mediator.transport.received_extend([
+            'mocked',
+            dumps({'error': 'eval failed: tab_id=2, expression=x, error=SyntaxError'}),
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            with patch('bruvtab.main.print_error') as print_error:
+                result = self._run_commands(['eval', 'x', 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': 'x'},
+        ]
+        print_error.assert_called_once_with(
+            'eval in a.1.2: eval failed: tab_id=2, expression=x, error=SyntaxError')
+        assert output == []
+        assert result == 1
+
+    def test_eval_reports_no_active_tabs(self):
+        self.mediator.transport.received_extend([
+            'mocked',
+            '',
+        ])
+
+        with patch('bruvtab.main.print_error') as print_error:
+            result = self._run_commands(['eval', '1 + 1'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'get_active_tabs'},
+        ]
+        print_error.assert_called_once_with('No active tabs found')
+        assert result == 1
+
+    def test_eval_plain_object_result_prints_json(self):
+        result = dumps({'title': 'Example', 'count': 2, 'items': [1, 2, 3]})
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', '({title: document.title, count: 2})', 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': '({title: document.title, count: 2})'},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        data = loads(output[0].decode('utf8'))
+        assert data == {'title': 'Example', 'count': 2, 'items': [1, 2, 3]}
+
+    def test_eval_nodelist_result_prints_descriptor_array(self):
+        result = dumps([
+            {'tag': 'a', 'id': 'home', 'class': 'nav-item', 'text': 'Home', 'href': 'https://example.com/'},
+            {'tag': 'img', 'id': 'logo', 'src': 'https://example.com/logo.png'},
+        ])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', "document.querySelectorAll('a')", 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': "document.querySelectorAll('a')"},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        data = loads(output[0].decode('utf8'))
+        assert isinstance(data, list)
+        assert data[0] == {
+            'tag': 'a', 'id': 'home', 'class': 'nav-item',
+            'text': 'Home', 'href': 'https://example.com/',
+        }
+        assert data[1]['tag'] == 'img'
+        assert data[1]['src'] == 'https://example.com/logo.png'
+
+    def test_eval_css_style_declaration_result_prints_property_map(self):
+        result = dumps({'color': 'rgb(0, 0, 255)', 'font-size': '16px', 'margin': '0px'})
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', 'getComputedStyle(document.body)', 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': 'getComputedStyle(document.body)'},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        data = loads(output[0].decode('utf8'))
+        assert data == {'color': 'rgb(0, 0, 255)', 'font-size': '16px', 'margin': '0px'}
+        assert data['color'] == 'rgb(0, 0, 255)'
+
+    def test_eval_date_result_prints_iso_string(self):
+        expression = 'new Date(0)'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == '1970-01-01T00:00:00.000Z'
+
+    def test_eval_map_result_prints_object(self):
+        expression = 'new Map([["a", 1], ["b", 2]])'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == {'a': 1, 'b': 2}
+
+    def test_eval_set_result_prints_array(self):
+        expression = 'new Set([1, 2, 3])'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == [1, 2, 3]
+
+    def test_eval_error_result_prints_error_descriptor(self):
+        expression = 'new Error("boom")'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        data = loads(output[0].decode('utf8'))
+        assert data == {'name': 'Error', 'message': 'boom', 'stack': 'Error: boom'}
+
+    def test_eval_circular_object_result_marks_circular(self):
+        expression = '(function () { const obj = {a: 1}; obj.self = obj; return obj; })()'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == {'a': 1, 'self': '$circular'}
+
+    def test_eval_custom_class_instance_result_has_type_tag(self):
+        expression = ('(function () { class Point { constructor(x, y) { this.x = x; this.y = y; } }'
+                      ' return new Point(1, 2); })()')
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == {'__type': 'Point', 'x': 1, 'y': 2}
+
+    def test_eval_awaited_promise_result_prints_resolved_value(self):
+        expression = 'new Promise(r => setTimeout(() => r(42), 50))'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == 42
+
+    def test_eval_awaited_promise_result_prints_resolved_object(self):
+        expression = 'new Promise(r => setTimeout(() => r({ok: true}), 50))'
+        result = dumps(EVAL_EXPRESSION_RESULTS[expression])
+        self.mediator.transport.received_extend([
+            'mocked',
+            result,
+        ])
+
+        output = []
+        with patch('bruvtab.main.stdout_buffer_write', output.append):
+            self._run_commands(['eval', expression, 'a.1.2'])
+        self._assert_init()
+        assert self.mediator.transport.sent == [
+            {'name': 'eval', 'tab_id': 2, 'expression': expression},
+        ]
+        assert output == [result.encode('utf8') + b'\n']
+        assert loads(output[0].decode('utf8')) == {'ok': True}
+
+
+class TestEvalDummyMediator(TestCase):
+    """
+    Run the eval command against a DummyBrowserRemoteAPI-backed mediator,
+    which emulates the extension's universal serializer + async await.
+    """
+
+    def setUp(self):
+        self.mediator = MockedMediator('a', remote_api=DummyBrowserRemoteAPI())
+
+    def tearDown(self):
+        self.mediator.join()
+
+    def _eval(self, expression):
+        output = []
+        with patch('bruvtab.main.get_mediator_ports') as mocked:
+            mocked.side_effect = [range(self.mediator.port, self.mediator.port + 1)]
+            with patch('bruvtab.main.stdout_buffer_write', output.append):
+                result = run_commands(['eval', expression, 'a.1.1'])
+        assert result == 0
+        assert len(output) == 1
+        return loads(output[0].decode('utf8'))
+
+    def test_eval_date_result_is_iso_string(self):
+        assert self._eval('new Date(0)') == '1970-01-01T00:00:00.000Z'
+
+    def test_eval_map_result_is_object(self):
+        assert self._eval('new Map([["a", 1], ["b", 2]])') == {'a': 1, 'b': 2}
+
+    def test_eval_set_result_is_array(self):
+        assert self._eval('new Set([1, 2, 3])') == [1, 2, 3]
+
+    def test_eval_error_result_is_descriptor(self):
+        data = self._eval('new Error("boom")')
+        assert data == {'name': 'Error', 'message': 'boom', 'stack': 'Error: boom'}
+
+    def test_eval_circular_object_result_marks_circular(self):
+        expression = '(function () { const obj = {a: 1}; obj.self = obj; return obj; })()'
+        assert self._eval(expression) == {'a': 1, 'self': '$circular'}
+
+    def test_eval_custom_class_instance_result_has_type_tag(self):
+        expression = ('(function () { class Point { constructor(x, y) { this.x = x; this.y = y; } }'
+                      ' return new Point(1, 2); })()')
+        assert self._eval(expression) == {'__type': 'Point', 'x': 1, 'y': 2}
+
+    def test_eval_awaited_promise_result_is_resolved_value(self):
+        assert self._eval('new Promise(r => setTimeout(() => r(42), 50))') == 42
+
+    def test_eval_awaited_promise_result_is_resolved_object(self):
+        assert self._eval('new Promise(r => setTimeout(() => r({ok: true}), 50))') == {'ok': True}
 
 
 class TestJsonOutput(TestCase):
